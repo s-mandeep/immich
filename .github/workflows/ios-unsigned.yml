@@ -11,7 +11,7 @@ permissions:
 jobs:
   build-ios-unsigned:
     name: Build unsigned iOS IPA
-    runs-on: macos-15
+    runs-on: macos-15-intel   # x86 Mac pool: on 6 Nov 00:00 IST the arm64 pool never picked the job up (capacity notice)
     timeout-minutes: 90
     steps:
       - name: Checkout
