@@ -46,6 +46,14 @@ jobs:
         working-directory: ./mobile
         run: flutter test test/unit/mirror_sync_planner_test.dart
 
+      - name: Select newest Xcode on the runner (device_info_plus needs the iOS 26+ SDK)
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Selecting $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          xcodebuild -version
+
       - name: Build iOS (release, no codesign)
         working-directory: ./mobile
         run: flutter build ios --release --no-codesign
