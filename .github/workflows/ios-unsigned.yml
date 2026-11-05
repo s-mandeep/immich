@@ -31,6 +31,13 @@ jobs:
         working-directory: ./mobile
         run: mise run install:ci
 
+      - name: Stub pnpm (only used to re-format translation JSON, which is committed formatted)
+        run: |
+          mkdir -p "$HOME/pnpm-stub"
+          printf '#!/bin/sh\necho "pnpm stub: skipped $*"\n' > "$HOME/pnpm-stub/pnpm"
+          chmod +x "$HOME/pnpm-stub/pnpm"
+          echo "$HOME/pnpm-stub" >> "$GITHUB_PATH"
+
       - name: Code generation (openapi, drift, freezed, pigeon, translations)
         working-directory: ./mobile
         run: mise run codegen
