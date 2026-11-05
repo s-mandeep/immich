@@ -13,6 +13,9 @@ jobs:
     name: Build unsigned iOS IPA
     runs-on: macos-15-intel   # x86 Mac pool: on 6 Nov 00:00 IST the arm64 pool never picked the job up (capacity notice)
     timeout-minutes: 90
+    env:
+      # pnpm 11 has no darwin/amd64 build; the mobile build and its Dart codegen do not use it
+      MISE_DISABLE_TOOLS: pnpm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
