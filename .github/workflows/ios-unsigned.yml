@@ -63,7 +63,7 @@ jobs:
         run: |
           rm -rf Payload Runner-unsigned.ipa
           mkdir Payload
-          cp -R build/ios/iphoneos/Runner.app Payload/
+          cp -R build/ios/iphoneos/*.app Payload/   # the app bundle is named Immich.app
           zip -qry Runner-unsigned.ipa Payload
           ls -la Runner-unsigned.ipa
 
