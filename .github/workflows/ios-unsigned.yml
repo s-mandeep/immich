@@ -1,0 +1,57 @@
+name: iOS unsigned IPA (fork)
+
+# Fork (mandeep/photos): builds an UNSIGNED Runner.ipa for SideStore / AltStore to re-sign.
+# Manual trigger only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios-unsigned:
+    name: Build unsigned iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up mise (Flutter 3.47.2, Java, openapi generator per mise.toml)
+        uses: jdx/mise-action@v2
+        with:
+          working_directory: ./mobile
+
+      - name: Install Flutter dependencies
+        working-directory: ./mobile
+        run: mise run install:ci
+
+      - name: Code generation (openapi, drift, freezed, pigeon, translations)
+        working-directory: ./mobile
+        run: mise run codegen
+
+      - name: Run fork unit tests
+        working-directory: ./mobile
+        run: flutter test test/unit/mirror_sync_planner_test.dart
+
+      - name: Build iOS (release, no codesign)
+        working-directory: ./mobile
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        working-directory: ./mobile
+        run: |
+          rm -rf Payload Runner-unsigned.ipa
+          mkdir Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Runner-unsigned.ipa Payload
+          ls -la Runner-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: immich-fork-ios-unsigned
+          path: mobile/Runner-unsigned.ipa
+          retention-days: 14

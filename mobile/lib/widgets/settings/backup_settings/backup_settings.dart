@@ -1,11 +1,15 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_hooks/flutter_hooks.dart' hide Store;
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/album/local_album.model.dart';
 import 'package:immich_mobile/domain/models/config/app_config.dart';
 import 'package:immich_mobile/domain/models/settings_key.dart';
+import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/domain/services/sync_linked_album.service.dart';
+import 'package:immich_mobile/domain/utils/mirror_sync_planner.dart';
+import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/extensions/build_context_extensions.dart';
 import 'package:immich_mobile/extensions/platform_extensions.dart';
 import 'package:immich_mobile/generated/translations.g.dart';
@@ -14,7 +18,94 @@ import 'package:immich_mobile/providers/backup/backup_album.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/platform.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/settings.provider.dart';
 import 'package:immich_mobile/providers/user.provider.dart';
+import 'package:immich_mobile/services/app_settings.service.dart';
+import 'package:immich_mobile/utils/hooks/app_settings_update_hook.dart';
 import 'package:immich_ui/immich_ui.dart';
+
+/// Fork (mandeep/photos): "Back up photos from" date. Older assets are never uploaded.
+class _BackupFromDateSetting extends HookWidget {
+  const _BackupFromDateSetting();
+
+  @override
+  Widget build(BuildContext context) {
+    final fromMs = useState<int>(Store.get(StoreKey.backupFromDateMs, 0));
+
+    Future<void> save(int value) async {
+      fromMs.value = value;
+      await Store.put(StoreKey.backupFromDateMs, value);
+    }
+
+    final from = fromMs.value > 0 ? DateTime.fromMillisecondsSinceEpoch(fromMs.value) : null;
+    final label = from == null
+        ? 'All photos (no date filter)'
+        : '${from.year}-${from.month.toString().padLeft(2, '0')}-${from.day.toString().padLeft(2, '0')} onwards';
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 8.0),
+      child: Column(
+        children: [
+          SettingListTile(
+            title: label,
+            subtitle: 'Photos and videos taken before this date are not uploaded.',
+            onTap: () async {
+              final now = DateTime.now();
+              final picked = await showDatePicker(
+                context: context,
+                initialDate: from ?? startOfYear(now),
+                firstDate: DateTime(1990),
+                lastDate: now,
+              );
+              if (picked != null) {
+                await save(DateTime(picked.year, picked.month, picked.day).millisecondsSinceEpoch);
+              }
+            },
+          ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => save(startOfYear(DateTime.now()).millisecondsSinceEpoch),
+                child: const Text('Only this year'),
+              ),
+              TextButton(onPressed: () => save(0), child: const Text('Clear')),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Fork (mandeep/photos): iOS two-way mirror switches.
+class _MirrorSettings extends HookWidget {
+  const _MirrorSettings();
+
+  @override
+  Widget build(BuildContext context) {
+    final serverDeletes = useAppSettingsState(AppSettingsEnum.mirrorServerDeletes);
+    final phoneDeletes = useAppSettingsState(AppSettingsEnum.mirrorPhoneDeletes);
+    final favorites = useAppSettingsState(AppSettingsEnum.mirrorFavorites);
+    return Column(
+      children: [
+        SettingsSwitchListTile(
+          valueNotifier: serverDeletes,
+          title: 'Server deletes reach this iPhone',
+          subtitle: 'Asks once, then removes the photos (they go to Recently Deleted).',
+        ),
+        SettingsSwitchListTile(
+          valueNotifier: phoneDeletes,
+          title: 'iPhone deletes reach the server',
+          subtitle: 'Backed-up photos deleted here are moved to the server trash.',
+        ),
+        SettingsSwitchListTile(
+          valueNotifier: favorites,
+          title: 'Sync favourites both ways',
+          subtitle: 'The latest favourite change on either side wins.',
+        ),
+      ],
+    );
+  }
+}
 
 class BackupSettings extends StatelessWidget {
   const BackupSettings({super.key});
@@ -35,6 +126,15 @@ class BackupSettings extends StatelessWidget {
         const Divider(),
         SettingGroupTitle(title: context.t.backup_albums_sync, icon: Icons.sync),
         const _AlbumSyncActionButton(),
+        // Fork (mandeep/photos)
+        const Divider(),
+        const SettingGroupTitle(title: 'Back up photos from', icon: Icons.date_range),
+        const _BackupFromDateSetting(),
+        if (CurrentPlatform.isIOS) ...[
+          const Divider(),
+          const SettingGroupTitle(title: 'iPhone mirror', icon: Icons.sync_alt),
+          const _MirrorSettings(),
+        ],
       ],
     );
   }

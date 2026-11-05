@@ -21,6 +21,12 @@ enum StoreKey<T> {
 
   syncMigrationStatus<String>._(1013),
 
+  // Fork (mandeep/photos) settings. Ids 9001+ to stay clear of upstream ids.
+  backupFromDateMs<int>._(9001),
+  mirrorServerDeletes<bool>._(9002),
+  mirrorPhoneDeletes<bool>._(9003),
+  mirrorFavorites<bool>._(9004),
+
   // Legacy keys that have been migrated to the new metadata store
   legacyBackupRequireCharging<bool>._(7),
   legacyBackupTriggerDelay<int>._(8),

@@ -32,6 +32,7 @@ import native_video_player
     BackgroundWorkerFgHostApiSetup.setUp(binaryMessenger: messenger, api: BackgroundWorkerApiImpl())
     ConnectivityApiSetup.setUp(binaryMessenger: messenger, api: ConnectivityApiImpl())
     NetworkApiSetup.setUp(binaryMessenger: messenger, api: NetworkApiImpl())
+    MirrorApiImpl.register(messenger: messenger)
   }
 
   public static func cancelPlugins(with engine: FlutterEngine) {

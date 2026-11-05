@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/domain/services/log.service.dart';
+import 'package:immich_mobile/domain/services/mirror_sync.service.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/extensions/platform_extensions.dart';
 import 'package:immich_mobile/providers/auth.provider.dart';
@@ -145,7 +146,9 @@ class AppLifeCycleNotifier extends StateNotifier<AppLifeCycleEnum> {
       _ref.invalidate(allMemoriesProvider);
       if (syncSuccess) {
         await Future.wait([
-          _safeRun(backgroundManager.hashAssets, "hashAssets").then((_) {
+          _safeRun(backgroundManager.hashAssets, "hashAssets").then((_) async {
+            // Fork: iOS two-way mirror (deletes and favourites) once hashes are current
+            await _safeRun(() => _ref.read(mirrorSyncServiceProvider).run(), "mirrorSync");
             unawaited(_resumeBackup());
           }),
           _resumeBackup(),

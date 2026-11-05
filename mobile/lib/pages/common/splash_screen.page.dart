@@ -9,6 +9,7 @@ import 'package:immich_mobile/constants/locales.dart';
 import 'package:immich_mobile/data/db/main/database.dart';
 import 'package:immich_mobile/domain/models/config/app_config.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
+import 'package:immich_mobile/domain/services/mirror_sync.service.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/extensions/platform_extensions.dart';
 import 'package:immich_mobile/generated/codegen_loader.g.dart';
@@ -336,7 +337,13 @@ class SplashScreenPageState extends ConsumerState<SplashScreenPage> {
 
                   if (syncSuccess) {
                     await Future.wait([
-                      backgroundManager.hashAssets().then((_) {
+                      backgroundManager.hashAssets().then((_) async {
+                        // Fork: iOS two-way mirror (deletes and favourites) once hashes are current
+                        try {
+                          await ref.read(mirrorSyncServiceProvider).run();
+                        } catch (e) {
+                          log.warning('Mirror sync failed: $e');
+                        }
                         unawaited(_resumeBackup(backupNotifier, lifeCycle));
                       }),
                       _resumeBackup(backupNotifier, lifeCycle),

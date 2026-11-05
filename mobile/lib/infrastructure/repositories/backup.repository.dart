@@ -6,7 +6,19 @@ import 'package:immich_mobile/data/db/main/table/local/album_asset.drift.dart';
 import 'package:immich_mobile/data/db/main/table/local/asset.dart';
 import 'package:immich_mobile/domain/models/album/local_album.model.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
+import 'package:immich_mobile/domain/models/store.model.dart';
+import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/infrastructure/repositories/backup.repository.drift.dart';
+
+/// Fork (mandeep/photos): "Back up photos from" date in ms since epoch; 0 = no filter.
+int backupFromDateMs() {
+  try {
+    return Store.get(StoreKey.backupFromDateMs, 0);
+  } catch (_) {
+    // Store not initialised in this isolate: no filter.
+    return 0;
+  }
+}
 
 @DriftAccessor()
 class BackupRepository extends DatabaseAccessor<Drift> with $BackupRepositoryMixin {
@@ -56,7 +68,8 @@ class BackupRepository extends DatabaseAccessor<Drift> with $BackupRepositoryMix
             INNER JOIN main.local_album_entity la on laa.album_id = la.id
             WHERE laa.asset_id = lae.id
                 AND la.backup_selection = ?3
-        );
+        )
+        AND (?4 = 0 OR julianday(lae.created_at) >= julianday(?4 / 1000.0, 'unixepoch'));
       ''';
 
     final row = await _db
@@ -66,6 +79,7 @@ class BackupRepository extends DatabaseAccessor<Drift> with $BackupRepositoryMix
             Variable.withString(userId),
             Variable.withInt(BackupSelection.selected.index),
             Variable.withInt(BackupSelection.excluded.index),
+            Variable.withInt(backupFromDateMs()),
           ],
           readsFrom: {_db.localAlbumAssetEntity, _db.localAlbumEntity, _db.localAssetEntity, _db.remoteAssetEntity},
         )
@@ -108,6 +122,16 @@ class BackupRepository extends DatabaseAccessor<Drift> with $BackupRepositoryMix
 
     if (onlyHashed) {
       query.where((lae) => lae.checksum.isNotNull());
+    }
+
+    // Fork: "Back up photos from" date filter. Assets created before it are never uploaded.
+    final fromMs = backupFromDateMs();
+    if (fromMs > 0) {
+      query.where(
+        (lae) => CustomExpression<bool>(
+          "julianday(local_asset_entity.created_at) >= julianday(${fromMs / 1000.0}, 'unixepoch')",
+        ),
+      );
     }
 
     return query.map((localAsset) => localAsset.toDto()).get();
