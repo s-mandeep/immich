@@ -26,6 +26,8 @@ enum StoreKey<T> {
   mirrorServerDeletes<bool>._(9002),
   mirrorPhoneDeletes<bool>._(9003),
   mirrorFavorites<bool>._(9004),
+  // JSON retry book for uploads that failed (lib/utils/upload_retry_policy.dart)
+  uploadRetryBook<String>._(9005),
 
   // Legacy keys that have been migrated to the new metadata store
   legacyBackupRequireCharging<bool>._(7),

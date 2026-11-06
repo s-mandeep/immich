@@ -62,6 +62,25 @@ class UploadRepository {
     return FileDownloader().start();
   }
 
+  /// Fork: links an uploaded (hidden) motion video to its Live Photo still on the server.
+  Future<bool> linkLivePhotoVideo(String stillRemoteId, String videoRemoteId) async {
+    try {
+      final String savedEndpoint = Store.get(StoreKey.serverEndpoint);
+      final response = await NetworkRepository.client.put(
+        Uri.parse('$savedEndpoint/assets/$stillRemoteId'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'livePhotoVideoId': videoRemoteId}),
+      );
+      if (response.statusCode == 200) {
+        return true;
+      }
+      logger.warning("Linking motion part to $stillRemoteId failed: ${response.statusCode} ${response.body}");
+    } catch (error) {
+      logger.warning("Linking motion part to $stillRemoteId failed: $error");
+    }
+    return false;
+  }
+
   Future<UploadResult> uploadFile({
     required File file,
     required String originalFileName,

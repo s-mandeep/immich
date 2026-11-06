@@ -23,6 +23,7 @@ import 'package:immich_mobile/providers/infrastructure/storage.provider.dart';
 import 'package:immich_mobile/repositories/asset_media.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/api.service.dart';
+import 'package:immich_mobile/services/upload_retry.tracker.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
 import 'package:immich_mobile/utils/fork_native.dart';
 import 'package:immich_mobile/utils/upload_batch_budget.dart';
@@ -31,6 +32,9 @@ import 'package:openapi/api.dart' as api;
 import 'package:path/path.dart' as p;
 
 part 'background_upload.service.freezed.dart';
+
+/// Fork: livePhotoVideoId marker for a Live Photo still queued without its motion part.
+const String kStillWithoutMotion = 'fork:motion-pending';
 
 final backgroundUploadServiceProvider = Provider((ref) {
   final db = ref.watch(driftProvider);
@@ -211,7 +215,11 @@ class BackgroundUploadService {
     }
 
     final skip = {...queued.ids, ...await _recentlyCompletedIds(), ...skipIds};
-    final candidates = (await _backupRepository.getCandidates(userId)).where((a) => !skip.contains(a.id)).toList();
+    final retry = UploadRetryTracker.instance..reload();
+    final candidates = retry.due(
+      (await _backupRepository.getCandidates(userId)).where((a) => !skip.contains(a.id)).toList(),
+      (asset) => asset.id,
+    );
     if (candidates.isEmpty) {
       _logger.info("No new backup candidates found, finishing background upload");
       return 0;
@@ -343,6 +351,7 @@ class BackgroundUploadService {
     if (update.status.isFinalState && update.task.group == kBackupGroup) {
       _scheduleChainedBatch();
     }
+    await _recordRetryOutcome(update);
     switch (update.status) {
       case TaskStatus.complete:
         unawaited(_handleLivePhoto(update));
@@ -359,6 +368,43 @@ class BackgroundUploadService {
 
       default:
         break;
+    }
+  }
+
+  /// Fork: feeds URLSession outcomes into the retry book, so failed assets back off and a still that
+  /// went up without its motion part gets the motion part retried later.
+  Future<void> _recordRetryOutcome(TaskStatusUpdate update) async {
+    if (!update.status.isFinalState || update.task.metaData.isEmpty) {
+      return;
+    }
+    try {
+      final metadata = UploadTaskMetadata.fromJson(update.task.metaData);
+      final retry = UploadRetryTracker.instance;
+      final assetId = metadata.localAssetId;
+      switch (update.status) {
+        case TaskStatus.complete:
+          if (metadata.isLivePhotos) {
+            return; // the still follows; its outcome decides
+          }
+          String? remoteId;
+          try {
+            remoteId = jsonDecode(update.responseBody ?? '')['id'] as String?;
+          } catch (_) {}
+          if (metadata.livePhotoVideoId == kStillWithoutMotion) {
+            await retry.motionPending(assetId, 'motion part not fetchable', stillRemoteId: remoteId);
+          } else if (!retry.isMotionPending(assetId)) {
+            await retry.succeeded(assetId);
+          }
+        case TaskStatus.failed || TaskStatus.notFound:
+          await retry.failed(
+            assetId,
+            'background upload ${update.status.name}: ${update.exception?.description ?? update.responseStatusCode ?? ''}',
+          );
+        default:
+          break;
+      }
+    } catch (error) {
+      dPrint(() => "Error recording upload outcome: $error");
     }
   }
 
@@ -426,6 +472,11 @@ class BackgroundUploadService {
     }
 
     File? file;
+    final retry = UploadRetryTracker.instance;
+    // Fork: a Live Photo whose motion part cannot be fetched (or is waiting for its retry time) goes up as
+    // a still alone; the motion part is recorded as pending when the still completes.
+    var isLivePhoto = entity.isLivePhoto;
+    var stillWithoutMotion = false;
 
     /// iOS LivePhoto has two files: a photo and a video.
     /// They are uploaded separately, with video file being upload first, then returned with the assetId
@@ -437,7 +488,15 @@ class BackgroundUploadService {
     /// The cancel operation will only cancel the video group (normal group), the photo group will not
     /// be touched, as the video file is already uploaded.
 
-    if (entity.isLivePhoto) {
+    if (isLivePhoto && group == kBackupGroup) {
+      file = retry.shouldFetchMotion(asset.id) ? await _storageRepository.getMotionFileForAsset(asset) : null;
+      if (file == null) {
+        _logger.warning("Motion part of ${asset.id} - ${asset.name} not fetchable; queuing the still alone");
+        isLivePhoto = false;
+        stillWithoutMotion = true;
+        file = await _storageRepository.getFileForAsset(asset.id);
+      }
+    } else if (isLivePhoto) {
       file = await _storageRepository.getMotionFileForAsset(asset);
     } else {
       file = await _storageRepository.getFileForAsset(asset.id);
@@ -445,6 +504,9 @@ class BackgroundUploadService {
 
     if (file == null) {
       _logger.warning("Failed to get file for asset ${asset.id} - ${asset.name}");
+      if (group == kBackupGroup) {
+        await retry.failed(asset.id, 'original not fetchable');
+      }
       return null;
     }
 
@@ -455,8 +517,8 @@ class BackgroundUploadService {
 
     final String metadata = UploadTaskMetadata(
       localAssetId: asset.id,
-      isLivePhotos: entity.isLivePhoto,
-      livePhotoVideoId: '',
+      isLivePhotos: isLivePhoto,
+      livePhotoVideoId: stillWithoutMotion ? kStillWithoutMotion : '',
       checksum: asset.checksum,
     ).toJson();
 
@@ -474,11 +536,11 @@ class BackgroundUploadService {
       isFavorite: asset.isFavorite,
       requiresWiFi: requiresWiFi,
       // Visibility hidden on upload to prevent the server from running regular jobs on the live photo asset
-      fields: entity.isLivePhoto ? {'visibility': api.AssetVisibility.hidden.toString()} : null,
-      cloudId: entity.isLivePhoto ? null : asset.cloudId,
-      adjustmentTime: entity.isLivePhoto ? null : asset.adjustmentTime?.toIso8601String(),
-      latitude: entity.isLivePhoto ? null : asset.latitude?.toString(),
-      longitude: entity.isLivePhoto ? null : asset.longitude?.toString(),
+      fields: isLivePhoto ? {'visibility': api.AssetVisibility.hidden.toString()} : null,
+      cloudId: isLivePhoto ? null : asset.cloudId,
+      adjustmentTime: isLivePhoto ? null : asset.adjustmentTime?.toIso8601String(),
+      latitude: isLivePhoto ? null : asset.latitude?.toString(),
+      longitude: isLivePhoto ? null : asset.longitude?.toString(),
     );
   }
 

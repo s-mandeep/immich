@@ -23,6 +23,7 @@ import 'package:immich_mobile/providers/infrastructure/platform.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/storage.provider.dart';
 import 'package:immich_mobile/repositories/asset_media.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
+import 'package:immich_mobile/services/upload_retry.tracker.dart';
 import 'package:logging/logging.dart';
 import 'package:openapi/api.dart';
 import 'package:path/path.dart' as p;
@@ -125,6 +126,10 @@ class ForegroundUploadService {
       }
     }
 
+    // Fork: assets that failed recently wait for their retry time instead of taking a worker.
+    final retry = UploadRetryTracker.instance..reload();
+    candidates = retry.due(candidates, (asset) => asset.id);
+
     final networkCapabilities = await _connectivityApi.getCapabilities();
     final hasWifi = networkCapabilities.isUnmetered;
     _logger.info('Network capabilities: $networkCapabilities, hasWifi/isUnmetered: $hasWifi');
@@ -141,6 +146,85 @@ class ForegroundUploadService {
         },
         processItem: (asset) => uploadSingleAsset(asset, cancelToken, callbacks: callbacks),
       );
+    }
+    if (!cancelToken.isCompleted) {
+      await retryPendingMotionParts(cancelToken);
+    }
+  }
+
+  /// Fork: uploads the motion parts of Live Photos whose stills went up alone, once their retry time has
+  /// come, and links each to its still on the server. A failure backs off further.
+  Future<void> retryPendingMotionParts(Completer<void>? cancelToken) async {
+    final retry = UploadRetryTracker.instance;
+    for (final assetId in retry.motionRetriesDue()) {
+      if (shouldAbortUpload || (cancelToken?.isCompleted ?? false)) {
+        return;
+      }
+      final stillRemoteId = retry.stillRemoteIdFor(assetId);
+      File? motionFile;
+      try {
+        final asset = await _assetService.getLocalAsset(assetId);
+        if (asset == null || stillRemoteId == null) {
+          await retry.succeeded(assetId); // gone from the phone: nothing left to do
+          continue;
+        }
+        motionFile = await _fetchMotionFile(asset);
+        if (motionFile == null) {
+          await retry.motionPending(assetId, 'motion part still not fetchable');
+          continue;
+        }
+        final fileName = await _assetMediaRepository.getOriginalFilename(asset.id) ?? asset.name;
+        final result = await _uploadRepository.uploadFile(
+          file: motionFile,
+          originalFileName: p.setExtension(fileName, p.extension(motionFile.path)),
+          fields: {
+            'deviceAssetId': asset.id,
+            'deviceId': Store.get(StoreKey.deviceId),
+            'fileCreatedAt': asset.createdAt.toUtc().toIso8601String(),
+            'fileModifiedAt': asset.updatedAt.toUtc().toIso8601String(),
+            'isFavorite': 'false',
+            'duration': '0',
+            'visibility': AssetVisibility.hidden.toString(),
+          },
+          cancelToken: cancelToken,
+          logContext: 'livePhotoVideoRetry[$assetId]',
+        );
+        if (result.isCancelled) {
+          return;
+        }
+        if (result.isSuccess &&
+            result.remoteAssetId != null &&
+            await _uploadRepository.linkLivePhotoVideo(stillRemoteId, result.remoteAssetId!)) {
+          _logger.info('Motion part of Live Photo $assetId uploaded and linked');
+          await retry.succeeded(assetId);
+        } else {
+          await retry.motionPending(assetId, 'motion upload or link failed: ${result.errorMessage ?? 'link'}');
+        }
+      } catch (error) {
+        await retry.motionPending(assetId, 'motion retry error: $error');
+      } finally {
+        if (Platform.isIOS) {
+          try {
+            await motionFile?.delete();
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
+  /// Fork: the Live Photo motion file, or null if it cannot be fetched in time (e.g. PHPhotosErrorDomain
+  /// 3169: original not fetchable from iCloud). Bounded so it never holds a worker for minutes.
+  Future<File?> _fetchMotionFile(LocalAsset asset) async {
+    try {
+      final local = await _storageRepository.isAssetAvailableLocally(asset.id);
+      final future = local
+          ? _storageRepository.getMotionFileForAsset(asset)
+          : _storageRepository.loadMotionFileFromCloud(asset.id);
+      final file = await future.timeout(const Duration(seconds: 90), onTimeout: () => null);
+      return file;
+    } catch (error) {
+      _logger.warning('Motion part of ${asset.id} not fetchable: $error');
+      return null;
     }
   }
 
@@ -284,6 +368,8 @@ class ForegroundUploadService {
         : t.asset_not_found_on_device_ios;
     File? file;
     File? livePhotoFile;
+    final retry = UploadRetryTracker.instance;
+    var motionMissing = false;
 
     try {
       final remoteId = (await _assetService.getLocalAsset(asset.id))?.remoteId;
@@ -295,10 +381,13 @@ class ForegroundUploadService {
       final entity = await _storageRepository.getAssetEntityForAsset(asset);
       if (entity == null) {
         callbacks.onError?.call(asset.localId!, assetNotFoundOnDevice);
+        await retry.failed(asset.id, 'asset not found on device');
         return;
       }
 
       final isAvailableLocally = await _storageRepository.isAssetAvailableLocally(asset.id);
+      // Fork: a Live Photo whose motion part failed earlier uploads its still alone until the retry time.
+      final fetchMotion = entity.isLivePhoto && retry.shouldFetchMotion(asset.id);
 
       if (!isAvailableLocally && CurrentPlatform.isIOS) {
         _logger.info("Loading iCloud asset ${asset.id} - ${asset.name}");
@@ -314,11 +403,9 @@ class ForegroundUploadService {
 
         try {
           file = await _storageRepository.loadFileFromCloud(asset.id, progressHandler: progressHandler);
-          if (entity.isLivePhoto) {
-            livePhotoFile = await _storageRepository.loadMotionFileFromCloud(
-              asset.id,
-              progressHandler: progressHandler,
-            );
+          if (fetchMotion && file != null) {
+            livePhotoFile = await _fetchMotionFile(asset);
+            motionMissing = livePhotoFile == null;
           }
         } finally {
           await progressSubscription.cancel();
@@ -329,15 +416,17 @@ class ForegroundUploadService {
         if (file == null) {
           _logger.warning("Failed to get file ${asset.id} - ${asset.name}");
           callbacks.onError?.call(asset.localId!, assetNotFoundOnDevice);
+          await retry.failed(asset.id, 'original not fetchable');
           return;
         }
 
         // For live photos, get the motion video file
-        if (entity.isLivePhoto) {
-          livePhotoFile = await _storageRepository.getMotionFileForAsset(asset);
+        if (fetchMotion) {
+          livePhotoFile = await _fetchMotionFile(asset);
           if (livePhotoFile == null) {
-            _logger.warning("Failed to obtain motion part of the livePhoto - ${asset.name}");
-            callbacks.onError?.call(asset.localId!, assetNotFoundOnDevice);
+            // Fork: upload the still alone; the motion part is retried later with backoff.
+            _logger.warning("Failed to obtain motion part of the livePhoto - ${asset.name}; uploading the still alone");
+            motionMissing = true;
           }
         }
       }
@@ -345,6 +434,7 @@ class ForegroundUploadService {
       if (file == null) {
         _logger.warning("Failed to obtain file from iCloud for asset ${asset.id} - ${asset.name}");
         callbacks.onError?.call(asset.localId!, t.asset_not_found_on_icloud);
+        await retry.failed(asset.id, 'original not fetchable from iCloud');
         return;
       }
 
@@ -384,6 +474,12 @@ class ForegroundUploadService {
 
         if (livePhotoResult.isSuccess && livePhotoResult.remoteAssetId != null) {
           livePhotoVideoId = livePhotoResult.remoteAssetId;
+        } else if (livePhotoResult.isCancelled) {
+          shouldAbortUpload = true;
+          return;
+        } else {
+          // Fork: still goes up alone; the motion part is retried later.
+          motionMissing = true;
         }
       }
 
@@ -420,6 +516,11 @@ class ForegroundUploadService {
       );
 
       if (result.isSuccess && result.remoteAssetId != null) {
+        if (motionMissing) {
+          await retry.motionPending(asset.id, 'motion part not fetchable', stillRemoteId: result.remoteAssetId);
+        } else if (!retry.isMotionPending(asset.id)) {
+          await retry.succeeded(asset.id);
+        }
         await _handleUploadSuccess(asset, result.remoteAssetId!, callbacks);
       } else if (result.isCancelled) {
         shouldAbortUpload = true;
@@ -430,6 +531,7 @@ class ForegroundUploadService {
         );
 
         callbacks.onError?.call(asset.localId!, result.errorMessage!);
+        await retry.failed(asset.id, 'upload error ${result.statusCode ?? ''}: ${result.errorMessage}');
 
         if (result.errorMessage == "Quota has been exceeded!") {
           shouldAbortUpload = true;
@@ -438,6 +540,7 @@ class ForegroundUploadService {
     } catch (error, stackTrace) {
       _logger.severe(() => "Error backup asset: $error", stackTrace);
       callbacks.onError?.call(asset.localId!, error.toString());
+      await retry.failed(asset.id, error.toString());
     } finally {
       if (Platform.isIOS) {
         try {
