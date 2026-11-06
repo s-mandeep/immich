@@ -65,8 +65,11 @@ class BackgroundWorkerApiImpl: BackgroundWorkerFgHostApi {
   private static func scheduleProcessingWorker() {
     let backgroundProcessing = BGProcessingTaskRequest(identifier: processingTaskID)
     
+    // Fork: overnight backup. Run on the charger with network; the Dart side keeps the upload queue
+    // filled until iOS expires the task. Rescheduled at the start of every run.
     backgroundProcessing.requiresNetworkConnectivity = true
-    backgroundProcessing.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60) // 15 mins
+    backgroundProcessing.requiresExternalPower = true
+    backgroundProcessing.earliestBeginDate = Date(timeIntervalSinceNow: 30 * 60) // 30 mins
     
     do {
         try BGTaskScheduler.shared.submit(backgroundProcessing)

@@ -39,6 +39,7 @@ class AppLifeCycleNotifier extends StateNotifier<AppLifeCycleEnum> {
   Future<void> handleAppResume() async {
     state = AppLifeCycleEnum.resumed;
     _log.info("App resumed");
+    _ref.read(backupProvider.notifier).stopURLSessionChaining();
 
     // Prevent overlapping resume operations
     if (_resumeOperation != null && !_resumeOperation!.isCompleted) {
@@ -225,6 +226,11 @@ class AppLifeCycleNotifier extends StateNotifier<AppLifeCycleEnum> {
   Future<void> _performPause() {
     if (_ref.read(authProvider).isAuthenticated) {
       _ref.read(backupProvider.notifier).stopForegroundBackup(reason: "the app being sent to the background");
+      // Fork: on iOS hand the rest of the backup to the background URLSession so it keeps going.
+      final currentUser = Store.tryGet(StoreKey.currentUser);
+      if (CurrentPlatform.isIOS && currentUser != null && _ref.read(appConfigProvider).backup.enabled) {
+        unawaited(_ref.read(backupProvider.notifier).handOffToURLSession(currentUser.id));
+      }
 
       _ref.read(websocketProvider.notifier).disconnect();
     }

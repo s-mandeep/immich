@@ -24,6 +24,8 @@ import 'package:immich_mobile/repositories/asset_media.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/api.service.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
+import 'package:immich_mobile/utils/fork_native.dart';
+import 'package:immich_mobile/utils/upload_batch_budget.dart';
 import 'package:logging/logging.dart';
 import 'package:openapi/api.dart' as api;
 import 'package:path/path.dart' as p;
@@ -116,6 +118,54 @@ class BackgroundUploadService {
 
   bool shouldAbortQueuingTasks = false;
 
+  /// Fork: chaining. While set (app in the background), finished uploads top the URLSession queue up
+  /// with the next batch so the library drains without the app being opened.
+  String? _chainUserId;
+  Timer? _chainTimer;
+  bool _chainRunning = false;
+
+  /// Top up once fewer tasks than this are left in the session.
+  static const int chainRefillBelow = 100;
+
+  void startChaining(String userId) => _chainUserId = userId;
+
+  void stopChaining() {
+    _chainUserId = null;
+    _chainTimer?.cancel();
+    _chainTimer = null;
+  }
+
+  void _scheduleChainedBatch() {
+    if (_chainUserId == null || _chainRunning) {
+      return;
+    }
+    // Debounce: iOS reports finished tasks in bursts when it wakes the app.
+    _chainTimer?.cancel();
+    _chainTimer = Timer(const Duration(seconds: 3), () => unawaited(_runChainedBatch()));
+  }
+
+  Future<void> _runChainedBatch() async {
+    final userId = _chainUserId;
+    if (userId == null || _chainRunning) {
+      return;
+    }
+    _chainRunning = true;
+    try {
+      await ForkNative.withBackgroundTime(() async {
+        final queued = await queuedCount();
+        if (queued >= chainRefillBelow) {
+          return;
+        }
+        final added = await uploadBackupCandidates(userId);
+        _logger.info("Chained batch: $queued still queued, $added added");
+      });
+    } catch (error, stack) {
+      _logger.warning("Chained batch failed", error, stack);
+    } finally {
+      _chainRunning = false;
+    }
+  }
+
   void _onTaskProgressCallback(TaskProgressUpdate update) {
     if (!_taskProgressController.isClosed) {
       _taskProgressController.add(update);
@@ -130,6 +180,7 @@ class BackgroundUploadService {
   }
 
   void dispose() {
+    stopChaining();
     unawaited(_taskStatusController.close());
     unawaited(_taskProgressController.close());
   }
@@ -146,35 +197,126 @@ class BackgroundUploadService {
 
   /// Start background upload using iOS URLSession
   ///
-  /// Finds backup candidates, builds upload tasks, and enqueues them
-  /// for background processing.
-  Future<void> uploadBackupCandidates(String userId) async {
-    await _storageRepository.clearCache();
+  /// Fork: hands iOS's background URLSession a large batch instead of ~6 held in the app. The batch is
+  /// bounded by [UploadBatchBudget] (300 files, 2 GB, 25% of free storage, counting what is already
+  /// queued), skips assets already queued or just uploaded, and is enqueued in chunks so a cut-off run
+  /// still hands its work to iOS. Returns the number of tasks enqueued.
+  Future<int> uploadBackupCandidates(String userId, {Set<String> skipIds = const {}}) async {
     shouldAbortQueuingTasks = false;
 
-    final candidates = await _backupRepository.getCandidates(userId);
+    final queued = await _queuedState();
+    // Temp files belong to the queued tasks; only clear them when nothing is queued.
+    if (queued.ids.isEmpty) {
+      await _storageRepository.clearCache();
+    }
+
+    final skip = {...queued.ids, ...await _recentlyCompletedIds(), ...skipIds};
+    final candidates = (await _backupRepository.getCandidates(userId)).where((a) => !skip.contains(a.id)).toList();
     if (candidates.isEmpty) {
       _logger.info("No new backup candidates found, finishing background upload");
-      return;
+      return 0;
     }
 
-    _logger.info("Found ${candidates.length} backup candidates for background tasks");
+    final budget = UploadBatchBudget(
+      freeBytes: await ForkNative.freeBytes(),
+      queuedFiles: queued.ids.length,
+      queuedBytes: queued.bytes,
+    );
+    _logger.info(
+      "Found ${candidates.length} backup candidates, ${queued.ids.length} already queued, free: ${budget.freeBytes}",
+    );
 
-    const batchSize = 100;
-    final batch = candidates.take(batchSize).toList();
-    final List<UploadTask> tasks = [];
-
-    for (final asset in batch) {
+    const chunkSize = 20;
+    var enqueued = 0;
+    final List<UploadTask> chunk = [];
+    for (final asset in candidates) {
+      if (shouldAbortQueuingTasks || budget.isFull) {
+        break;
+      }
       final task = await getUploadTask(asset);
-      if (task != null) {
-        tasks.add(task);
+      if (task == null) {
+        continue;
+      }
+      final size = await _fileSize(task);
+      if (!budget.tryAdd(size)) {
+        await _deleteTaskFile(task);
+        break;
+      }
+      chunk.add(task);
+      if (chunk.length >= chunkSize) {
+        enqueued += await _enqueueChunk(chunk);
       }
     }
+    enqueued += await _enqueueChunk(chunk);
+    _logger.info("Enqueued $enqueued background upload tasks (${budget.files} files, ${budget.bytes} bytes queued)");
+    return enqueued;
+  }
 
-    if (tasks.isNotEmpty && !shouldAbortQueuingTasks) {
-      _logger.info("Enqueuing ${tasks.length} background upload tasks");
-      await enqueueTasks(tasks);
+  Future<int> _enqueueChunk(List<UploadTask> chunk) async {
+    if (chunk.isEmpty) {
+      return 0;
     }
+    final tasks = List<UploadTask>.of(chunk);
+    chunk.clear();
+    if (shouldAbortQueuingTasks) {
+      await Future.wait(tasks.map(_deleteTaskFile));
+      return 0;
+    }
+    final results = await enqueueTasks(tasks);
+    return results.where((ok) => ok).length;
+  }
+
+  /// Ids and file bytes of the backup tasks iOS still holds
+  Future<({Set<String> ids, int bytes})> _queuedState() async {
+    final tasks = [
+      ...await _uploadRepository.getActiveTasks(kBackupGroup),
+      ...await _uploadRepository.getActiveTasks(kBackupLivePhotoGroup),
+    ];
+    var bytes = 0;
+    for (final task in tasks) {
+      if (task is UploadTask) {
+        bytes += await _fileSize(task);
+      }
+    }
+    return (ids: tasks.map((t) => t.taskId).toSet(), bytes: bytes);
+  }
+
+  /// Assets the session uploaded in the last 12 h; the remote sync may not have seen them yet.
+  Future<Set<String>> _recentlyCompletedIds() async {
+    try {
+      final records = await _uploadRepository.getTaskRecords(kBackupGroup);
+      final cutoff = DateTime.now().subtract(const Duration(hours: 12));
+      return records
+          .where((r) => r.status == TaskStatus.complete && r.task.creationTime.isAfter(cutoff))
+          .map((r) => r.taskId)
+          .toSet();
+    } catch (error) {
+      _logger.warning("Could not read upload records: $error");
+      return {};
+    }
+  }
+
+  /// Number of backup tasks (both groups) iOS still holds
+  Future<int> queuedCount() async {
+    final queued = await _queuedState();
+    return queued.ids.length;
+  }
+
+  Future<int> _fileSize(UploadTask task) async {
+    try {
+      return await File(await task.filePath()).length();
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  Future<void> _deleteTaskFile(UploadTask task) async {
+    if (!CurrentPlatform.isIOS) {
+      return;
+    }
+    try {
+      await File(await task.filePath()).delete();
+    } catch (_) {}
   }
 
   /// Cancel all ongoing background uploads and reset the upload queue
@@ -182,6 +324,7 @@ class BackgroundUploadService {
   /// Returns the number of tasks left in the queue
   Future<int> cancel() async {
     shouldAbortQueuingTasks = true;
+    _chainUserId = null;
 
     await _storageRepository.clearCache();
     await _uploadRepository.reset(kBackupGroup);
@@ -197,6 +340,9 @@ class BackgroundUploadService {
   }
 
   Future<void> _handleTaskStatusUpdate(TaskStatusUpdate update) async {
+    if (update.status.isFinalState && update.task.group == kBackupGroup) {
+      _scheduleChainedBatch();
+    }
     switch (update.status) {
       case TaskStatus.complete:
         unawaited(_handleLivePhoto(update));

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:immich_mobile/constants/constants.dart';
 import 'package:immich_mobile/domain/models/asset/asset_metadata.model.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart' hide AssetVisibility;
 import 'package:immich_mobile/domain/models/store.model.dart';
@@ -74,6 +75,23 @@ class ForegroundUploadService {
 
   bool shouldAbortUpload = false;
 
+  /// Fork: on iOS the temp dir also holds the files of uploads queued with the background URLSession;
+  /// clearing it under them would fail those uploads.
+  Future<void> _clearCacheUnlessQueued() async {
+    if (CurrentPlatform.isIOS) {
+      try {
+        for (final group in [kBackupGroup, kBackupLivePhotoGroup]) {
+          if ((await _uploadRepository.getActiveTasks(group)).isNotEmpty) {
+            return;
+          }
+        }
+      } catch (_) {
+        return;
+      }
+    }
+    await _storageRepository.clearCache();
+  }
+
   Future<({int total, int remainder, int processing})> getBackupCounts(String userId) {
     return _backupRepository.getAllCounts(userId);
   }
@@ -89,9 +107,22 @@ class ForegroundUploadService {
     UploadCallbacks callbacks = const UploadCallbacks(),
     bool useSequentialUpload = false,
   }) async {
-    final candidates = await _backupRepository.getCandidates(userId);
+    var candidates = await _backupRepository.getCandidates(userId);
     if (candidates.isEmpty) {
       return;
+    }
+
+    // Fork: skip assets the background URLSession still has queued from a hand-off.
+    if (CurrentPlatform.isIOS) {
+      try {
+        final queued = {
+          for (final group in [kBackupGroup, kBackupLivePhotoGroup])
+            ...(await _uploadRepository.getActiveTasks(group)).map((t) => t.taskId),
+        };
+        candidates = candidates.where((asset) => !queued.contains(asset.id)).toList();
+      } catch (error) {
+        _logger.warning('Could not read the background upload queue: $error');
+      }
     }
 
     final networkCapabilities = await _connectivityApi.getCapabilities();
@@ -120,7 +151,7 @@ class ForegroundUploadService {
     required bool hasWifi,
     required UploadCallbacks callbacks,
   }) async {
-    await _storageRepository.clearCache();
+    await _clearCacheUnlessQueued();
     shouldAbortUpload = false;
 
     for (final asset in items) {
@@ -206,7 +237,7 @@ class ForegroundUploadService {
     bool Function(T item)? shouldSkip,
     int concurrentWorkers = 3,
   }) async {
-    await _storageRepository.clearCache();
+    await _clearCacheUnlessQueued();
     shouldAbortUpload = false;
 
     int currentIndex = 0;

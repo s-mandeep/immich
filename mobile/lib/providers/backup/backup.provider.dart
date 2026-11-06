@@ -10,6 +10,7 @@ import 'package:immich_mobile/providers/infrastructure/db.provider.dart';
 import 'package:immich_mobile/providers/user.provider.dart';
 import 'package:immich_mobile/services/background_upload.service.dart';
 import 'package:immich_mobile/services/foreground_upload.service.dart';
+import 'package:immich_mobile/utils/fork_native.dart';
 import 'package:immich_mobile/utils/upload_speed_calculator.dart';
 import 'package:logging/logging.dart';
 
@@ -213,6 +214,7 @@ class BackupNotifier extends StateNotifier<BackupState> {
       return;
     }
     state = state.copyWith(backupCount: state.backupCount + 1, remainderCount: state.remainderCount - 1);
+    _uploadedThisSession.add(localAssetId);
     _uploadSpeedManager.removeTask(localAssetId);
 
     Future.delayed(const Duration(milliseconds: 1000), () {
@@ -265,18 +267,40 @@ class BackupNotifier extends StateNotifier<BackupState> {
     }
     _logger.info("Found ${tasks.length} pending tasks");
 
-    if (tasks.isEmpty) {
-      if (!await remoteSync) {
-        _logger.warning("Remote sync did not complete successfully, skipping new upload");
-        return;
-      }
-      _logger.info("No pending tasks, starting new upload");
-      return _backgroundUploadService.uploadBackupCandidates(userId);
+    if (tasks.isNotEmpty) {
+      _logger.info("Resuming upload ${tasks.length} assets");
+      await _backgroundUploadService.resume();
     }
 
-    _logger.info("Resuming upload ${tasks.length} assets");
-    return _backgroundUploadService.resume();
+    // Fork: top the URLSession queue up even when tasks are pending; the batch budget counts them.
+    if (!await remoteSync) {
+      _logger.warning("Remote sync did not complete successfully, skipping new upload");
+      return;
+    }
+    _logger.info("Queuing a new upload batch");
+    await _backgroundUploadService.uploadBackupCandidates(userId, skipIds: _uploadedThisSession);
   }
+
+  /// Fork: assets the foreground run uploaded since launch. The remote sync has not seen them yet,
+  /// so they would otherwise be handed to the URLSession again.
+  final Set<String> _uploadedThisSession = {};
+
+  /// Fork (iOS): the app is leaving the foreground. Hand the next batch to the background URLSession
+  /// and keep chaining batches as uploads finish, so backup continues after switching apps.
+  Future<void> handOffToURLSession(String userId) async {
+    _backgroundUploadService.startChaining(userId);
+    try {
+      final added = await ForkNative.withBackgroundTime(
+        () => _backgroundUploadService.uploadBackupCandidates(userId, skipIds: _uploadedThisSession),
+      );
+      _logger.info("Handed $added uploads to the background URLSession");
+    } catch (error, stack) {
+      _logger.warning("Hand-off to the background URLSession failed", error, stack);
+    }
+  }
+
+  /// Fork (iOS): back in the foreground; the foreground run takes over new assets.
+  void stopURLSessionChaining() => _backgroundUploadService.stopChaining();
 }
 
 final backupCandidateProvider = FutureProvider.autoDispose<List<LocalAsset>>((ref) {

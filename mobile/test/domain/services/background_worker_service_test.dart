@@ -64,7 +64,9 @@ void main() {
     when(() => mockUserService.tryGetMyUser()).thenReturn(UserStub.admin);
     when(() => mockUserService.watchMyUser()).thenAnswer((_) => const Stream.empty());
     when(() => mockBackgroundUploadService.getActiveTasks(kBackupGroup)).thenAnswer((_) async => []);
-    when(() => mockBackgroundUploadService.uploadBackupCandidates(any())).thenAnswer((_) async {});
+    when(
+      () => mockBackgroundUploadService.uploadBackupCandidates(any(), skipIds: any(named: 'skipIds')),
+    ).thenAnswer((_) async => 0);
     when(() => mockBackgroundUploadService.resume()).thenAnswer((_) async {});
 
     sut = BackgroundWorkerBgService(
@@ -88,11 +90,13 @@ void main() {
 
       final upload = sut.onIosUpload(true, 20);
       await pumpEventQueue();
-      verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any()));
+      verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any(), skipIds: any(named: 'skipIds')));
 
       remoteSync.complete(true);
       await upload;
-      verify(() => mockBackgroundUploadService.uploadBackupCandidates(UserStub.admin.id)).called(1);
+      verify(
+        () => mockBackgroundUploadService.uploadBackupCandidates(UserStub.admin.id, skipIds: any(named: 'skipIds')),
+      ).called(1);
     });
 
     test('does not list a new batch when the remote sync fails', () async {
@@ -100,7 +104,7 @@ void main() {
 
       await sut.onIosUpload(true, 20);
 
-      verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any()));
+      verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any(), skipIds: any(named: 'skipIds')));
     });
 
     test('does not list a new batch when the run times out before the remote sync finished', () {
@@ -114,7 +118,7 @@ void main() {
         remoteSync.complete(true);
         async.flushMicrotasks();
 
-        verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any()));
+        verifyNever(() => mockBackgroundUploadService.uploadBackupCandidates(any(), skipIds: any(named: 'skipIds')));
       });
     });
 

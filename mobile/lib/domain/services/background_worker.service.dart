@@ -24,6 +24,7 @@ import 'package:immich_mobile/providers/infrastructure/sync.provider.dart';
 import 'package:immich_mobile/providers/user.provider.dart';
 import 'package:immich_mobile/services/api.service.dart';
 import 'package:immich_mobile/services/auth.service.dart';
+import 'package:immich_mobile/services/background_upload.service.dart';
 import 'package:immich_mobile/services/foreground_upload.service.dart';
 import 'package:immich_mobile/services/localization.service.dart';
 import 'package:immich_mobile/utils/bootstrap.dart';
@@ -101,11 +102,14 @@ class BackgroundWorkerBgService extends BackgroundWorkerFlutterApi {
           // Initialize the file downloader
           FileDownloader().configure(
             globalConfig: [
-              // maxConcurrent: 6, maxConcurrentByHost(server):6, maxConcurrentByGroup: 3
-              (Config.holdingQueue, (6, 6, 3)),
               // On Android, if files are larger than 256MB, run in foreground service
               (Config.runInForegroundIfFileLargerThan, 256),
             ],
+            // maxConcurrent: 6, maxConcurrentByHost(server):6, maxConcurrentByGroup: 3
+            androidConfig: [(Config.holdingQueue, (6, 6, 3))],
+            // Fork: on iOS the background URLSession is the queue; a holding queue would keep tasks in
+            // the app process, where they stall when iOS suspends it and are lost when it is killed.
+            iOSConfig: [(Config.holdingQueue, false)],
           ),
           FileDownloader().trackTasksInGroup(kDownloadGroupLivePhoto, markDownloadedComplete: false),
           FileDownloader().trackTasks(),
@@ -173,6 +177,11 @@ class BackgroundWorkerBgService extends BackgroundWorkerFlutterApi {
         );
       } else {
         await all;
+        // Fork: overnight processing task (on power, no time limit). Keep the URLSession queue filled
+        // until the library is done or iOS expires the task.
+        if (await remoteSync.catchError((_) => false)) {
+          await _keepQueueFilled();
+        }
       }
     } catch (error, stack) {
       _logger.severe("Failed to complete iOS background upload", error, stack);
@@ -180,6 +189,44 @@ class BackgroundWorkerBgService extends BackgroundWorkerFlutterApi {
       sw.stop();
       _logger.info("iOS background upload completed in ${sw.elapsed.inSeconds}s");
       await _cleanup();
+    }
+  }
+
+  /// Fork: polls the URLSession queue every 30 s and tops it up when it runs low. Stops when nothing is
+  /// queued and nothing is left to add, when the task is cancelled (iOS expiry), or when the queue has
+  /// not moved for 15 minutes (no network progress; the next run retries).
+  Future<void> _keepQueueFilled() async {
+    final currentUser = _ref?.read(currentUserProvider);
+    if (!_isBackupEnabled || currentUser == null) {
+      return;
+    }
+    const poll = Duration(seconds: 30);
+    const stallLimit = Duration(minutes: 15);
+    var lastQueued = -1;
+    var lastProgress = DateTime.now();
+    while (!_cancellationToken.isCompleted && !_isCleanedUp) {
+      await Future.any([Future.delayed(poll), _cancellationToken.future]);
+      final uploadService = _ref?.read(backgroundUploadServiceProvider);
+      if (_cancellationToken.isCompleted || uploadService == null) {
+        return;
+      }
+      var queued = await uploadService.queuedCount();
+      if (lastQueued < 0 || queued < lastQueued) {
+        lastProgress = DateTime.now();
+      }
+      if (queued < BackgroundUploadService.chainRefillBelow) {
+        final added = await uploadService.uploadBackupCandidates(currentUser.id);
+        if (queued == 0 && added == 0) {
+          _logger.info("Overnight backup: nothing left to upload");
+          return;
+        }
+        queued += added;
+      }
+      lastQueued = queued;
+      if (DateTime.now().difference(lastProgress) > stallLimit) {
+        _logger.warning("Overnight backup: no upload finished in ${stallLimit.inMinutes} min, stopping");
+        return;
+      }
     }
   }
 

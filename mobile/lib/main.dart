@@ -114,7 +114,10 @@ Future<void> initApp() async {
     // maxConcurrent: 6, maxConcurrentByHost(server):6, maxConcurrentByGroup: 3
 
     // On Android, if files are larger than 256MB, run in foreground service
-    globalConfig: [(Config.holdingQueue, (6, 6, 3)), (Config.runInForegroundIfFileLargerThan, 256)],
+    globalConfig: [(Config.runInForegroundIfFileLargerThan, 256)],
+    androidConfig: [(Config.holdingQueue, (6, 6, 3))],
+    // Fork: on iOS the background URLSession is the queue (see background_worker.service.dart)
+    iOSConfig: [(Config.holdingQueue, false)],
   );
 
   await FileDownloader().trackTasksInGroup(kDownloadGroupLivePhoto, markDownloadedComplete: false);

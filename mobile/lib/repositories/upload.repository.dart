@@ -53,6 +53,11 @@ class UploadRepository {
     return FileDownloader().allTasks(group: group);
   }
 
+  /// Fork: the downloader's task records for [group] (kept because trackTasks() is on)
+  Future<List<TaskRecord>> getTaskRecords(String group) {
+    return FileDownloader().database.allRecords(group: group);
+  }
+
   Future<void> start() {
     return FileDownloader().start();
   }

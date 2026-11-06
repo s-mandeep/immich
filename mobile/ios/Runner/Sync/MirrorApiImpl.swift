@@ -30,6 +30,23 @@ class MirrorApiImpl: NSObject {
         MirrorApiImpl.setFavorite(ids: ids, favorite: favorite) { changed in
           DispatchQueue.main.async { result(changed) }
         }
+      // Fork background backup: free storage for batch sizing, and background time for the hand-off
+      // to the background URLSession when the app leaves the foreground.
+      case "freeBytes":
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        result(values?.volumeAvailableCapacityForImportantUsage.map { Int($0) })
+      case "beginBackgroundTask":
+        var taskId: UIBackgroundTaskIdentifier = .invalid
+        taskId = UIApplication.shared.beginBackgroundTask(withName: "immich.fork.backup") {
+          UIApplication.shared.endBackgroundTask(taskId)
+        }
+        result(taskId.rawValue)
+      case "endBackgroundTask":
+        if let raw = call.arguments as? Int, raw != UIBackgroundTaskIdentifier.invalid.rawValue {
+          UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: raw))
+        }
+        result(nil)
       default:
         result(FlutterMethodNotImplemented)
       }
