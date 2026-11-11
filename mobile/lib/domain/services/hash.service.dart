@@ -113,7 +113,8 @@ class HashService {
     final hashed = <String, String>{};
     final hashResults = await _nativeSyncApi.hashAssets(
       toHash.keys.toList(),
-      allowNetworkAccess: album.backupSelection == BackupSelection.selected,
+      // Fork (11 Nov): never download an original from iCloud to hash it; iCloud-only assets stay unhashed.
+      allowNetworkAccess: false,
     );
     assert(
       hashResults.length == toHash.length,

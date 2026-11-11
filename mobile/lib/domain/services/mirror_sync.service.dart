@@ -1,6 +1,7 @@
 // Fork (mandeep/photos): iOS two-way mirror between the iPhone library and the Immich server.
 //  1. server trash/delete -> one prompt -> one PhotoKit batch delete (iOS confirms once; Recently Deleted)
-//  2. iPhone delete -> server trash
+//  2. (11 Nov) a delete in the native Photos app only frees phone storage: it never reaches the server.
+//     Deleting inside this app trashes on the server and removes the phone copy (upstream delete action).
 //  3. favourites both ways, last-seen value per asset so only real changes move
 import 'dart:convert';
 import 'dart:io';
@@ -10,8 +11,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/data/db/main/database.dart';
-import 'package:immich_mobile/domain/models/album/local_album.model.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
+import 'package:immich_mobile/domain/services/library_link.service.dart';
+import 'package:immich_mobile/domain/utils/library_link_matcher.dart';
 import 'package:immich_mobile/domain/utils/mirror_sync_planner.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/extensions/platform_extensions.dart';
@@ -22,9 +24,6 @@ import 'package:immich_mobile/routing/router.dart';
 import 'package:immich_mobile/utils/option.dart';
 import 'package:logging/logging.dart';
 import 'package:path_provider/path_provider.dart';
-
-/// Phone deletes above this number are confirmed by the user before they reach the server.
-const int kMirrorPhoneDeleteAskAbove = 50;
 
 final mirrorSyncServiceProvider = Provider(
   (ref) => MirrorSyncService(
@@ -49,7 +48,7 @@ class MirrorSyncService {
 
   MirrorOptions get _options => MirrorOptions(
     serverDeletes: Store.get(StoreKey.mirrorServerDeletes, true),
-    phoneDeletes: Store.get(StoreKey.mirrorPhoneDeletes, true),
+    phoneDeletes: false, // 11 Nov: native Photos deletes never reach the server
     favorites: Store.get(StoreKey.mirrorFavorites, true),
   );
 
@@ -59,7 +58,7 @@ class MirrorSyncService {
       return;
     }
     final options = _options;
-    if (!options.serverDeletes && !options.phoneDeletes && !options.favorites) {
+    if (!options.serverDeletes && !options.favorites) {
       return;
     }
     final user = Store.tryGet(StoreKey.currentUser);
@@ -110,36 +109,14 @@ class MirrorSyncService {
     );
     final next = Map<String, MirrorPair>.of(plan.nextState);
 
-    // 2. iPhone deletes -> server trash. Confirm with PhotoKit that the assets are really gone.
-    if (plan.trashOnServer.isNotEmpty) {
-      final byRemote = {for (final p in state.pairs.values) p.remoteId: p.localId};
-      final localIds = plan.trashOnServer.map((r) => byRemote[r]).nonNulls.toList();
-      final stillThere = (await _channel.invokeListMethod<String>('existing', {'ids': localIds}) ?? []).toSet();
-      final toTrash = plan.trashOnServer.where((r) => !stillThere.contains(byRemote[r])).toList();
-      for (final r in plan.trashOnServer.where((r) => stillThere.contains(byRemote[r]))) {
-        // Still on the phone (local DB lagging): keep the pair for next time.
-        final p = state.pairs[byRemote[r]];
-        if (p != null) {
-          next[p.localId] = p;
-        }
-      }
-      if (toTrash.isNotEmpty) {
-        final ok =
-            toTrash.length <= kMirrorPhoneDeleteAskAbove ||
-            await _ask('${toTrash.length} photos were deleted on this iPhone. Move them to the server trash too?');
-        if (ok) {
-          _log.info('Mirror: moving ${toTrash.length} assets to the server trash');
-          await _assetApi.delete(toTrash, false);
-          await _db.remoteAssetRepository.trash(toTrash);
-        } else {
-          // Not now: keep the pairs so the question comes back next time.
-          for (final r in toTrash) {
-            final p = state.pairs[byRemote[r]];
-            if (p != null) {
-              next[p.localId] = p;
-            }
-          }
-        }
+    // Safety gate: pairs made from metadata (Link library) get server->phone deletes only after the 100-sample
+    // hash check passed.
+    final link = await LibraryLinkService.loadState(userId);
+    if (link.gate != LinkGateStatus.passed && link.linkedLocalIds.isNotEmpty) {
+      final held = plan.deleteOnPhone.where(link.linkedLocalIds.contains).length;
+      if (held > 0) {
+        _log.info('Mirror: $held server deletes held back for metadata-linked photos (hash check not passed)');
+        plan.deleteOnPhone.removeWhere(link.linkedLocalIds.contains);
       }
     }
 
@@ -212,13 +189,10 @@ class MirrorSyncService {
           FROM local_asset_entity lae
           INNER JOIN remote_asset_entity rae ON rae.checksum = lae.checksum AND rae.owner_id = ?1
           WHERE lae.checksum IS NOT NULL
-            AND EXISTS (
-              SELECT 1 FROM local_album_asset_entity laa
-              INNER JOIN local_album_entity la ON laa.album_id = la.id
-              WHERE laa.asset_id = lae.id AND la.backup_selection = ?2
-            )
           ''',
-          variables: [Variable.withString(userId), Variable.withInt(BackupSelection.selected.index)],
+          // 11 Nov: any phone asset with a checksum (hashed, or linked by Link library) is mirrored; Backup
+          // album selection is no longer required, so Backup can stay off.
+          variables: [Variable.withString(userId)],
         )
         .get();
     return rows

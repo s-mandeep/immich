@@ -8,7 +8,7 @@ enum AppSettingsEnum<T> {
   readonlyModeEnabled<bool>(StoreKey.readonlyModeEnabled, false),
   // Fork (mandeep/photos): iOS two-way mirror, each on by default
   mirrorServerDeletes<bool>(StoreKey.mirrorServerDeletes, true),
-  mirrorPhoneDeletes<bool>(StoreKey.mirrorPhoneDeletes, true),
+  mirrorPhoneDeletes<bool>(StoreKey.mirrorPhoneDeletes, false), // unused since 11 Nov (never propagated),
   mirrorFavorites<bool>(StoreKey.mirrorFavorites, true);
 
   const AppSettingsEnum(this.storeKey, this.defaultValue);

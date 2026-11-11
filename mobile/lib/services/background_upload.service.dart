@@ -471,6 +471,15 @@ class BackgroundUploadService {
       return null;
     }
 
+    // Fork (11 Nov): never download originals from iCloud (photo_manager's file export allows the network).
+    if (CurrentPlatform.isIOS && !await _storageRepository.isAssetAvailableLocally(asset.id)) {
+      _logger.info("Skipping iCloud-only asset ${asset.id} - ${asset.name} (no iCloud downloads)");
+      if (group == kBackupGroup) {
+        await UploadRetryTracker.instance.failed(asset.id, 'iCloud-only original (not downloaded)');
+      }
+      return null;
+    }
+
     File? file;
     final retry = UploadRetryTracker.instance;
     // Fork: a Live Photo whose motion part cannot be fetched (or is waiting for its retry time) goes up as

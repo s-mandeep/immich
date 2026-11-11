@@ -7,6 +7,7 @@ import 'package:immich_mobile/domain/models/album/local_album.model.dart';
 import 'package:immich_mobile/domain/models/config/app_config.dart';
 import 'package:immich_mobile/domain/models/settings_key.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
+import 'package:immich_mobile/domain/services/library_link.service.dart';
 import 'package:immich_mobile/domain/services/sync_linked_album.service.dart';
 import 'package:immich_mobile/domain/utils/mirror_sync_planner.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
@@ -21,6 +22,7 @@ import 'package:immich_mobile/providers/user.provider.dart';
 import 'package:immich_mobile/services/app_settings.service.dart';
 import 'package:immich_mobile/utils/hooks/app_settings_update_hook.dart';
 import 'package:immich_ui/immich_ui.dart';
+import 'package:share_plus/share_plus.dart';
 
 /// Fork (mandeep/photos): "Back up photos from" date. Older assets are never uploaded.
 class _BackupFromDateSetting extends HookWidget {
@@ -83,7 +85,6 @@ class _MirrorSettings extends HookWidget {
   @override
   Widget build(BuildContext context) {
     final serverDeletes = useAppSettingsState(AppSettingsEnum.mirrorServerDeletes);
-    final phoneDeletes = useAppSettingsState(AppSettingsEnum.mirrorPhoneDeletes);
     final favorites = useAppSettingsState(AppSettingsEnum.mirrorFavorites);
     return Column(
       children: [
@@ -92,17 +93,106 @@ class _MirrorSettings extends HookWidget {
           title: 'Server deletes reach this iPhone',
           subtitle: 'Asks once, then removes the photos (they go to Recently Deleted).',
         ),
-        SettingsSwitchListTile(
-          valueNotifier: phoneDeletes,
-          title: 'iPhone deletes reach the server',
-          subtitle: 'Backed-up photos deleted here are moved to the server trash.',
+        const ListTile(
+          title: Text('Deleting in the iPhone Photos app'),
+          subtitle: Text(
+            'Only frees space on this iPhone. Server and archive copies stay. Delete in this app to remove a photo everywhere.',
+          ),
         ),
+        const _LinkLibraryTile(),
         SettingsSwitchListTile(
           valueNotifier: favorites,
           title: 'Sync favourites both ways',
           subtitle: 'The latest favourite change on either side wins.',
         ),
       ],
+    );
+  }
+}
+
+/// Fork (mandeep/photos), 11 Nov: pair the iPhone library with the server by metadata (no hashing, no iCloud
+/// downloads), then copy phone albums and Favourites to the server. Backup is not touched.
+class _LinkLibraryTile extends HookConsumerWidget {
+  const _LinkLibraryTile();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final running = useState(false);
+    final status = useState('');
+    final gate = useState('');
+
+    Future<void> refresh() async {
+      final user = Store.tryGet(StoreKey.currentUser);
+      if (user == null) {
+        return;
+      }
+      final state = await LibraryLinkService.loadState(user.id);
+      gate.value = state.gateText;
+      if (status.value.isEmpty) {
+        status.value = state.summary;
+      }
+    }
+
+    useEffect(() {
+      unawaited(refresh());
+      return null;
+    }, const []);
+
+    Future<void> run() async {
+      running.value = true;
+      try {
+        // Make sure the app's copy of the server and phone libraries is current first.
+        status.value = 'Syncing with the server...';
+        final sync = ref.read(backgroundSyncProvider);
+        await sync.syncLocal();
+        await sync.syncRemote();
+        await ref.read(libraryLinkServiceProvider).link((s) => status.value = s);
+      } catch (e) {
+        status.value = 'Link failed: $e';
+      } finally {
+        running.value = false;
+        await refresh();
+      }
+    }
+
+    Future<void> share() async {
+      final file = await LibraryLinkService.reportFile();
+      if (!file.existsSync() || !context.mounted) {
+        return;
+      }
+      final size = MediaQuery.of(context).size;
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        text: 'Immich link report',
+        sharePositionOrigin: Rect.fromPoints(Offset.zero, Offset(size.width / 3, size.height)),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Link library', style: TextStyle(fontWeight: FontWeight.bold)),
+          const Text(
+            'Pairs this iPhone\'s photos with the server copies by name, date and size (no downloads, '
+            'Backup stays off), then copies your albums and Favourites to the server.',
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              ElevatedButton(
+                onPressed: running.value ? null : run,
+                child: Text(running.value ? 'Linking...' : 'Link library'),
+              ),
+              const SizedBox(width: 12),
+              TextButton(onPressed: running.value ? null : share, child: const Text('Share report')),
+            ],
+          ),
+          if (status.value.isNotEmpty) Text(status.value),
+          if (gate.value.isNotEmpty) Text(gate.value, style: const TextStyle(fontStyle: FontStyle.italic)),
+        ],
+      ),
     );
   }
 }

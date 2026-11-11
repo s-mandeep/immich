@@ -100,20 +100,27 @@ void main() {
       expect(plan.nextState, isEmpty);
     });
 
-    test('phone delete moves the server copy to trash', () {
+    test('native Photos delete never reaches the server (pair forgotten)', () {
       final plan = _plan(previous: [_pair('1')], local: {}, remote: {'r1'});
-      expect(plan.trashOnServer, ['r1']);
+      expect(plan.trashOnServer, isEmpty);
+      expect(plan.deleteOnPhone, isEmpty);
+      expect(plan.isEmpty, isTrue);
       expect(plan.nextState, isEmpty);
     });
 
-    test('phone delete disabled: nothing trashed', () {
+    test('native Photos delete ignored even with the old phoneDeletes option on', () {
       final plan = _plan(
-        previous: [_pair('1')],
+        previous: [_pair('1'), _pair('2')],
         local: {},
-        remote: {'r1'},
-        options: const MirrorOptions(phoneDeletes: false),
+        remote: {'r1', 'r2'},
+        options: const MirrorOptions(phoneDeletes: true),
       );
       expect(plan.trashOnServer, isEmpty);
+      expect(plan.isEmpty, isTrue);
+    });
+
+    test('phoneDeletes defaults to off', () {
+      expect(const MirrorOptions().phoneDeletes, isFalse);
     });
 
     test('asset never paired is never deleted anywhere', () {

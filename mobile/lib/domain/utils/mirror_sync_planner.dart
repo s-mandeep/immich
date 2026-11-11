@@ -54,7 +54,8 @@ class MirrorPlan {
   /// Phone assets whose server copy is trashed or gone: ask, then delete from the phone.
   final List<String> deleteOnPhone = [];
 
-  /// Server assets whose phone copy was deleted: move to the server trash.
+  /// Always empty since 11 Nov (Mandeep's rule: deleting in the native Photos app only frees phone storage;
+  /// the server and HDD copies stay). Kept so callers and tests can assert it.
   final List<String> trashOnServer = [];
 
   /// Remote ids to favourite / unfavourite on the server.
@@ -79,10 +80,12 @@ class MirrorPlan {
 
 class MirrorOptions {
   final bool serverDeletes;
+
+  /// Ignored by the planner since 11 Nov: a phone-side disappearance never reaches the server.
   final bool phoneDeletes;
   final bool favorites;
 
-  const MirrorOptions({this.serverDeletes = true, this.phoneDeletes = true, this.favorites = true});
+  const MirrorOptions({this.serverDeletes = true, this.phoneDeletes = false, this.favorites = true});
 }
 
 /// Builds the plan.
@@ -117,11 +120,8 @@ MirrorPlan planMirror({
     final remotePresent = remoteIdsInDb.contains(pair.remoteId);
 
     if (!localPresent && remotePresent) {
-      // Deleted on the phone, still on the server.
-      if (options.phoneDeletes) {
-        plan.trashOnServer.add(pair.remoteId);
-      }
-      continue; // drop from state either way
+      // Deleted in the native Photos app: only frees phone storage. The server copy stays; forget the pair.
+      continue;
     }
 
     if (localPresent && !remotePresent) {

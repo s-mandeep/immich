@@ -217,9 +217,10 @@ class ForegroundUploadService {
   Future<File?> _fetchMotionFile(LocalAsset asset) async {
     try {
       final local = await _storageRepository.isAssetAvailableLocally(asset.id);
-      final future = local
-          ? _storageRepository.getMotionFileForAsset(asset)
-          : _storageRepository.loadMotionFileFromCloud(asset.id);
+      if (!local) {
+        return null; // Fork (11 Nov): no iCloud downloads
+      }
+      final future = _storageRepository.getMotionFileForAsset(asset);
       final file = await future.timeout(const Duration(seconds: 90), onTimeout: () => null);
       return file;
     } catch (error) {
@@ -389,6 +390,12 @@ class ForegroundUploadService {
       // Fork: a Live Photo whose motion part failed earlier uploads its still alone until the retry time.
       final fetchMotion = entity.isLivePhoto && retry.shouldFetchMotion(asset.id);
 
+      if (!isAvailableLocally && CurrentPlatform.isIOS) {
+        // Fork (11 Nov): never download originals from iCloud. Skip and record; listed for a later decision.
+        _logger.info("Skipping iCloud-only asset ${asset.id} - ${asset.name} (no iCloud downloads)");
+        await retry.failed(asset.id, 'iCloud-only original (not downloaded)');
+        return;
+      }
       if (!isAvailableLocally && CurrentPlatform.isIOS) {
         _logger.info("Loading iCloud asset ${asset.id} - ${asset.name}");
 
