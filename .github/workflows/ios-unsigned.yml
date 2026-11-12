@@ -4,6 +4,9 @@ name: iOS unsigned IPA (fork)
 # Manual trigger only.
 on:
   workflow_dispatch:
+  push:
+    branches: [mandeep/photos]
+    paths: ['mobile/**', '.github/workflows/ios-unsigned.yml']
 
 permissions:
   contents: read
