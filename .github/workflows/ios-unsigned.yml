@@ -44,7 +44,7 @@ jobs:
 
       - name: Run fork unit tests
         working-directory: ./mobile
-        run: flutter test test/unit/mirror_sync_planner_test.dart test/unit/library_link_matcher_test.dart
+        run: flutter test test/unit/mirror_sync_planner_test.dart test/unit/library_link_matcher_test.dart test/unit/library_album_planner_test.dart
 
       - name: Select newest Xcode on the runner (device_info_plus needs the iOS 26+ SDK)
         run: |

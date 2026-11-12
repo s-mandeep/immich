@@ -20,9 +20,11 @@ import 'package:immich_mobile/providers/infrastructure/platform.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/settings.provider.dart';
 import 'package:immich_mobile/providers/user.provider.dart';
 import 'package:immich_mobile/services/app_settings.service.dart';
+import 'package:immich_mobile/utils/fork_native.dart';
 import 'package:immich_mobile/utils/hooks/app_settings_update_hook.dart';
 import 'package:immich_ui/immich_ui.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// Fork (mandeep/photos): "Back up photos from" date. Older assets are never uploaded.
 class _BackupFromDateSetting extends HookWidget {
@@ -140,16 +142,21 @@ class _LinkLibraryTile extends HookConsumerWidget {
 
     Future<void> run() async {
       running.value = true;
+      // photos-v4: keep the screen from auto-locking while linking, and ask iOS for background time if the
+      // phone is locked or the app is left anyway. The pass is additive and remembers created albums, so if
+      // iOS still stops it, tapping Link library again resumes without duplicates.
+      unawaited(WakelockPlus.enable());
       try {
         // Make sure the app's copy of the server and phone libraries is current first.
         status.value = 'Syncing with the server...';
         final sync = ref.read(backgroundSyncProvider);
         await sync.syncLocal();
         await sync.syncRemote();
-        await ref.read(libraryLinkServiceProvider).link((s) => status.value = s);
+        await ForkNative.withBackgroundTime(() => ref.read(libraryLinkServiceProvider).link((s) => status.value = s));
       } catch (e) {
-        status.value = 'Link failed: $e';
+        status.value = 'Link failed: $e (tap Link library again to resume; nothing is duplicated)';
       } finally {
+        unawaited(WakelockPlus.disable());
         running.value = false;
         await refresh();
       }
@@ -176,7 +183,7 @@ class _LinkLibraryTile extends HookConsumerWidget {
           const Text('Link library', style: TextStyle(fontWeight: FontWeight.bold)),
           const Text(
             'Pairs this iPhone\'s photos with the server copies by name, date and size (no downloads, '
-            'Backup stays off), then copies your albums and Favourites to the server.',
+            'Backup stays off), then copies all your albums (own, shared, synced, Selfies, Screenshots, Videos...) and Favourites to the server. (photos-v4)',
           ),
           const SizedBox(height: 8),
           Row(

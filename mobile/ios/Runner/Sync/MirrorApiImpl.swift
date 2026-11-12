@@ -93,7 +93,7 @@ class MirrorApiImpl: NSObject {
           "fav": asset.isFavorite,
         ]
         if let d = asset.creationDate { m["t"] = Int64(floor(d.timeIntervalSince1970)) }
-        if let r = originalResource(for: asset) {
+        if let r = MirrorApiImpl.originalResource(for: asset) {
           m["name"] = r.originalFilename
           if let size = r.value(forKey: "fileSize") as? NSNumber { m["size"] = size.int64Value }
           if let local = r.value(forKey: "locallyAvailable") as? NSNumber { m["local"] = local.boolValue }
@@ -101,16 +101,100 @@ class MirrorApiImpl: NSObject {
         assets.append(m)
       }
     }
+    // photos-v4 (12 Nov): every album, like the stock app (.album and .smartAlbum, subtype .any): regular,
+    // shared (iCloud), synced from a computer, imported, plus the media-type smart albums. Excluded smart albums
+    // are still listed (kind "smart", their key) so the report can say why; their members are not read.
+    var libraryIds = Set<String>()
+    for m in assets { if let id = m["id"] as? String { libraryIds.insert(id) } }
+    var albumOnly: [String: PHAsset] = [:]
     var albums: [[String: Any]] = []
-    let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
-    collections.enumerateObjects { collection, _, _ in
-      autoreleasepool {
-        var ids: [String] = []
-        PHAsset.fetchAssets(in: collection, options: nil).enumerateObjects { a, _, _ in ids.append(a.localIdentifier) }
-        albums.append(["id": collection.localIdentifier, "name": collection.localizedTitle ?? "", "assets": ids])
+    let memberOptions = PHFetchOptions()
+    memberOptions.includeHiddenAssets = false
+    for type in [PHAssetCollectionType.album, PHAssetCollectionType.smartAlbum] {
+      let collections = PHAssetCollection.fetchAssetCollections(with: type, subtype: .any, options: nil)
+      collections.enumerateObjects { collection, _, _ in
+        autoreleasepool {
+          let (kind, smart) = MirrorApiImpl.albumKind(collection)
+          var entry: [String: Any] = [
+            "id": collection.localIdentifier,
+            "name": collection.localizedTitle ?? "",
+            "kind": kind,
+          ]
+          if let smart = smart { entry["smart"] = smart }
+          var ids: [String] = []
+          if kind != "smart" || MirrorApiImpl.syncedSmartKeys.contains(smart ?? "") {
+            PHAsset.fetchAssets(in: collection, options: memberOptions).enumerateObjects { a, _, _ in
+              ids.append(a.localIdentifier)
+              if !libraryIds.contains(a.localIdentifier) && albumOnly[a.localIdentifier] == nil {
+                albumOnly[a.localIdentifier] = a
+              }
+            }
+          }
+          entry["assets"] = ids
+          albums.append(entry)
+        }
       }
     }
-    return ["assets": assets, "albums": albums]
+    // Assets that live only in a shared / synced album (not in the library fetch): metadata only.
+    var extra: [[String: Any]] = []
+    for (_, asset) in albumOnly {
+      autoreleasepool {
+        var m: [String: Any] = [
+          "id": asset.localIdentifier,
+          "type": asset.mediaType.rawValue,
+          "w": asset.pixelWidth,
+          "h": asset.pixelHeight,
+          "fav": false,
+        ]
+        if let d = asset.creationDate { m["t"] = Int64(floor(d.timeIntervalSince1970)) }
+        if let r = MirrorApiImpl.originalResource(for: asset) {
+          m["name"] = r.originalFilename
+          if let size = r.value(forKey: "fileSize") as? NSNumber { m["size"] = size.int64Value }
+          if let local = r.value(forKey: "locallyAvailable") as? NSNumber { m["local"] = local.boolValue }
+        }
+        extra.append(m)
+      }
+    }
+    return ["assets": assets, "albums": albums, "albumOnly": extra]
+  }
+
+  /// Smart albums copied to the server (keys match library_album_planner.dart).
+  static let syncedSmartKeys: Set<String> = [
+    "selfies", "portraits", "panoramas", "screenshots", "livePhotos", "videos", "slomo", "timelapses",
+    "bursts", "cinematic",
+  ]
+
+  /// (kind, smart key). Raw values so the code builds with any SDK (218 = smartAlbumCinematicVideos, iOS 16;
+  /// 1000000201 = Recently Deleted and 1000000219 = Recovered are private subtypes).
+  static func albumKind(_ c: PHAssetCollection) -> (String, String?) {
+    let raw = c.assetCollectionSubtype.rawValue
+    if c.assetCollectionType == .smartAlbum {
+      switch raw {
+      case 210: return ("smart", "selfies")
+      case 212: return ("smart", "portraits")
+      case 201: return ("smart", "panoramas")
+      case 211: return ("smart", "screenshots")
+      case 213: return ("smart", "livePhotos")
+      case 202: return ("smart", "videos")
+      case 208: return ("smart", "slomo")
+      case 204: return ("smart", "timelapses")
+      case 207: return ("smart", "bursts")
+      case 218: return ("smart", "cinematic")
+      case 209: return ("smart", "recents")
+      case 203: return ("smart", "favorites")
+      case 205: return ("smart", "hidden")
+      case 206: return ("smart", "recentlyAdded")
+      case 1000000201: return ("smart", "recentlyDeleted")
+      default: return ("smart", "other\(raw)")
+      }
+    }
+    switch raw {
+    case 2: return ("regular", nil)  // albumRegular
+    case 3, 4, 5, 6: return ("synced", nil)  // syncedEvent, syncedFaces, syncedAlbum, imported
+    case 100, 101: return ("shared", nil)  // albumMyPhotoStream, albumCloudShared
+    case 1000000219: return ("smart", "recovered")
+    default: return ("regular", nil)
+    }
   }
 
   /// SHA-1 (base64, like the server checksum) of each asset's ORIGINAL resource, only when it is on the phone:
